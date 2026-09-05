@@ -1,0 +1,135 @@
+name: Sync Rules and Convert to MRS
+
+on:
+  workflow_dispatch: # 支持手动点击运行
+  schedule:
+    # 北京时间每天早上 07:00 执行（UTC 时间为前一天 23:00）
+    - cron: "0 23 * * *"
+
+permissions:
+  contents: write # 必须赋予写入权限以创建 Release 和推送分支
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set variables
+        run: |
+          echo "RELEASE_NAME=Released on $(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+          echo "TAG_NAME=$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Mihomo
+        run: |
+          echo "Fetching latest Mihomo release..."
+          MIHOMO_URL=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+            | jq -r '.assets[] | select(.name | test("mihomo-linux-amd64-compatible-.*\\.gz$")) | .browser_download_url' | head -n 1)
+
+          if [ -z "$MIHOMO_URL" ] || [ "$MIHOMO_URL" = "null" ]; then
+            MIHOMO_URL=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+              | jq -r '.assets[] | select(.name | test("mihomo-linux-amd64-.*\\.gz$")) | .browser_download_url' | head -n 1)
+          fi
+
+          echo "Downloading Mihomo from: $MIHOMO_URL"
+          curl -sSL "$MIHOMO_URL" -o mihomo.gz
+          gunzip -f mihomo.gz
+          chmod +x mihomo
+          sudo mv mihomo /usr/local/bin/mihomo
+          mihomo -v
+        shell: bash
+
+      - name: Download rules and convert to MRS
+        run: |
+          download_rule() {
+            local file="$1"
+            local raw_url="https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/${file}"
+            local cdn_url="https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/${file}"
+            
+            echo "=========================================="
+            echo "Fetching ${file}..."
+            if curl -sSLf --connect-timeout 10 --max-time 30 -o "${file}" "${raw_url}"; then
+              echo "[SUCCESS] Downloaded ${file} from raw.githubusercontent.com"
+            else
+              echo "[WARN] Failed from raw.githubusercontent.com, fallback to jsDelivr CDN..."
+              if curl -sSLf --connect-timeout 10 --max-time 30 -o "${file}" "${cdn_url}"; then
+                echo "[SUCCESS] Downloaded ${file} from cdn.jsdelivr.net"
+              else
+                echo "[ERROR] Failed to download ${file} from both sources!" >&2
+                exit 1
+              fi
+            fi
+          }
+
+          DOMAIN_RULES=(
+            "direct.txt"
+            "proxy.txt"
+            "reject.txt"
+            "private.txt"
+            "apple.txt"
+            "icloud.txt"
+            "google.txt"
+            "gfw.txt"
+            "tld-not-cn.txt"
+          )
+
+          IPCIDR_RULES=(
+            "telegramcidr.txt"
+            "lancidr.txt"
+            "cncidr.txt"
+          )
+
+          for file in "${DOMAIN_RULES[@]}"; do
+            download_rule "$file"
+            base_name="${file%.txt}"
+            echo "Converting $file -> ${base_name}.mrs ..."
+            mihomo convert-ruleset domain yaml "$file" "${base_name}.mrs"
+          done
+
+          for file in "${IPCIDR_RULES[@]}"; do
+            download_rule "$file"
+            base_name="${file%.txt}"
+            echo "Converting $file -> ${base_name}.mrs ..."
+            mihomo convert-ruleset ipcidr yaml "$file" "${base_name}.mrs"
+          done
+        shell: bash
+
+      - name: Prepare publish directory
+        run: |
+          mkdir -p publish
+          cp *.txt *.mrs ./publish/
+
+      - name: Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          tag_name: ${{ env.TAG_NAME }}
+          draft: false
+          prerelease: false
+          files: |
+            ./publish/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Git push assets to "release" branch
+        run: |
+          cd publish || exit 1
+          git init
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b release
+          git add .
+          git commit -m "${{ env.RELEASE_NAME }}"
+          git remote add origin "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git push -f origin release
+
+      - name: Purge jsdelivr CDN
+        run: |
+          cd publish || exit 1
+          for file in *; do
+            curl -i "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/${file}"
+          done
